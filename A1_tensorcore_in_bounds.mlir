@@ -1,0 +1,18 @@
+#rowcol = affine_map<(d0, d1) -> (d1, d0)>
+#mA = affine_map<(d0, d1, d2) -> (d0, d2)>
+#mB = affine_map<(d0, d1, d2) -> (d1, d2)>
+#mC = affine_map<(d0, d1, d2) -> (d0, d1)>
+// Dynamic shapes: nothing can be proven by the folder.
+// Boundedness asserted via in_bounds (status quo).
+func.func @dyn_in_bounds(%a: memref<?x?xf16, #gpu.address_space<workgroup>>,
+                         %b: memref<?x?xf16, #gpu.address_space<workgroup>>,
+                         %c: memref<?x?xf16, #gpu.address_space<workgroup>>) {
+  %c0 = arith.constant 0 : index
+  %f0 = arith.constant 0.000000e+00 : f16
+  %A = vector.transfer_read %a[%c0, %c0], %f0 {in_bounds = [true, true]} : memref<?x?xf16, #gpu.address_space<workgroup>>, vector<16x16xf16>
+  %B = vector.transfer_read %b[%c0, %c0], %f0 {permutation_map = #rowcol, in_bounds = [true, true]} : memref<?x?xf16, #gpu.address_space<workgroup>>, vector<8x16xf16>
+  %C = vector.transfer_read %c[%c0, %c0], %f0 {in_bounds = [true, true]} : memref<?x?xf16, #gpu.address_space<workgroup>>, vector<16x8xf16>
+  %D = vector.contract {indexing_maps = [#mA, #mB, #mC], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %A, %B, %C : vector<16x16xf16>, vector<8x16xf16> into vector<16x8xf16>
+  vector.transfer_write %D, %c[%c0, %c0] {in_bounds = [true, true]} : vector<16x8xf16>, memref<?x?xf16, #gpu.address_space<workgroup>>
+  return
+}
