@@ -2,7 +2,8 @@
 #mA = affine_map<(d0, d1, d2) -> (d0, d2)>
 #mB = affine_map<(d0, d1, d2) -> (d1, d2)>
 #mC = affine_map<(d0, d1, d2) -> (d0, d1)>
-// The RFC proposal literally applied: dynamic shapes, no in_bounds and no mask.
+// Mask-free diagnostic control: even if A2's mask is proved all-true and
+// eliminated, these dynamic memref extents do not prove the tile is in bounds.
 func.func @dyn_no_in_bounds(
     %a: memref<?x?xf16, #gpu.address_space<workgroup>>,
     %b: memref<?x?xf16, #gpu.address_space<workgroup>>,

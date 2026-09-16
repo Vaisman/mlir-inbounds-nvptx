@@ -34,9 +34,10 @@ A3_tensorcore_no_in_bounds       ldmatrix=0 mma.sync=0 transfer_read_left=3 cont
 With `in_bounds = [true, true]` the tile becomes three `nvgpu.ldmatrix` and one `nvgpu.mma.sync`.
 The explicit-runtime-mask arm has no `in_bounds` attribute, so it does not use the
 mask-plus-`in_bounds` combination marked for future restriction in `VectorOps.td`. Its transfers
-and contract remain. More importantly, `A3_tensorcore_no_in_bounds.mlir` is the RFC proposal itself
-rather than a masked substitute:
-there is no `in_bounds` and no explicit mask. It reaches the same conversion cliff.
+and contract remain. `A3_tensorcore_no_in_bounds.mlir` is a mask-free diagnostic control, not the
+proposal itself: it shows the form left if A2's mask can be proved all-true and eliminated. The
+dynamic memref extents still provide no proof that the tile is in bounds, so it reaches the same
+conversion cliff.
 
 `A1_tensorcore_kernel.mlir` also carries the positive arm through
 `mlir-opt -> mlir-translate -> llc`; its PTX contains three `ldmatrix.sync` and one
@@ -119,9 +120,10 @@ dynamic:
 
 Section A is the load-bearing result. With today's GPU conversion, either an explicit mask or an
 unproved out-of-bounds dimension prevents the transfer from reaching Tensor Core operations.
-Removing `in_bounds` therefore requires the boundedness proof to be preserved or reconstructed
-before `convert-vector-to-gpu`; eliminating an explicit all-true mask alone does not cover the
-mask-free A3 case.
+Removing `in_bounds` therefore requires its boundedness guarantee to be carried in another IR
+form, or rederived where the IR contains sufficient size and index constraints, before
+`convert-vector-to-gpu`; eliminating an explicit all-true mask alone does not cover the mask-free
+A3 case.
 
 The mechanism meant for that job is `vector::eliminateVectorMasks`, and today it cannot do it:
 
