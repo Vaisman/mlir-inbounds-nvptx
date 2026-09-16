@@ -9,10 +9,12 @@ MLIR to LLVM IR to the NVPTX backend to PTX.
 ## How to run
 
 ```bash
-BIN=/path/to/llvm-project/build/bin ./run.sh
+LLVM_SOURCE_ROOT=/path/to/llvm-project BIN=/path/to/llvm-project/build/bin ./run.sh
 ```
 
 Needs `mlir-opt`, `mlir-translate` and `llc` built with `NVPTX` in `LLVM_TARGETS_TO_BUILD`.
+Both paths are required: `LLVM_SOURCE_ROOT` identifies the source checkout for provenance, while
+`BIN` points to the built tools (which may live in an out-of-tree build).
 No GPU and no CUDA toolkit required: everything here is static PTX emitted by `llc`.
 
 ## A. Removing `in_bounds` blocks the current Tensor Core path
@@ -135,7 +137,7 @@ this compounds section A.
 
 - Checkout llvm-project `f0d41abb33b6`.
 - `mlir-opt`, `mlir-translate`, and `llc` were all rebuilt from that checkout on 2026-09-15 before
-  the recorded run. `run.sh` prints the checkout and all three binary timestamps.
+  the recorded run. `run.sh` prints the HEAD of `LLVM_SOURCE_ROOT` and all three binary timestamps.
 - The working tree contained two unrelated uncommitted changes in NVGPU shared-memory
   optimization. None of the four pipelines in `run.sh` invokes `nvgpu-optimize-shared-memory`.
 - `llc -mtriple=nvptx64-nvidia-cuda -mcpu=sm_80`.

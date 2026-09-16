@@ -1,9 +1,22 @@
 #!/usr/bin/env bash
 # NVIDIA/NVPTX datapoint for the `in_bounds` vs masking RFC.
-# Usage: BIN=/path/to/llvm-project/build/bin ./run.sh
+# Usage: LLVM_SOURCE_ROOT=/path/to/llvm-project BIN=/path/to/build/bin ./run.sh
 set -euo pipefail
-BIN="${BIN:-$(git rev-parse --show-toplevel)/build/bin}"
+: "${BIN:?Set BIN to the llvm-project build/bin directory}"
+: "${LLVM_SOURCE_ROOT:?Set LLVM_SOURCE_ROOT to the llvm-project source checkout}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
+
+for tool in mlir-opt mlir-translate llc; do
+  if [[ ! -x "$BIN/$tool" ]]; then
+    printf 'error: %s is missing or not executable\n' "$BIN/$tool" >&2
+    exit 1
+  fi
+done
+if [[ ! -d "$LLVM_SOURCE_ROOT/llvm" || ! -d "$LLVM_SOURCE_ROOT/mlir" ]]; then
+  printf 'error: LLVM_SOURCE_ROOT must point to an llvm-project source checkout\n' >&2
+  exit 1
+fi
+LLVM_HEAD="$(git -C "$LLVM_SOURCE_ROOT" rev-parse HEAD)"
 
 GPU_PIPE='builtin.module(func.func(convert-vector-to-gpu{use-nvgpu=true},canonicalize,cse))'
 LLVM_PIPE='builtin.module(canonicalize,convert-vector-to-llvm,finalize-memref-to-llvm,convert-arith-to-llvm,convert-func-to-llvm,reconcile-unrealized-casts)'
@@ -11,7 +24,7 @@ KERN_PIPE='builtin.module(gpu.module(convert-vector-to-llvm,convert-gpu-to-nvvm,
 TENSORCORE_PIPE='builtin.module(gpu.module(convert-vector-to-gpu{use-nvgpu=true},affine-expand-index-ops,lower-affine,convert-nvgpu-to-nvvm,convert-gpu-to-nvvm,convert-vector-to-llvm,convert-arith-to-llvm,reconcile-unrealized-casts,canonicalize,cse))'
 
 echo "== Provenance =="
-printf 'checkout: %s\n' "$(git -C "$HERE" rev-parse HEAD)"
+printf 'llvm-project HEAD: %s\n' "$LLVM_HEAD"
 stat -c '%n: %y' "$BIN/mlir-opt" "$BIN/mlir-translate" "$BIN/llc"
 echo
 
