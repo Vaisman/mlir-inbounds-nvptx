@@ -43,17 +43,17 @@ conversion cliff.
 `mlir-opt -> mlir-translate -> llc`; its PTX contains three `ldmatrix.sync` and one
 `mma.sync`.
 
-This is not a cost difference, it is a capability cliff, and it is structural. Every relevant
-warp-level matrix lowering requires both no mask and no out-of-bounds dimension:
+This is not a cost difference, it is a capability cliff, and it is structural. The relevant GPU
+conversion checks below all require an unmasked, in-bounds transfer:
 
-| location | gate |
+| location | guarded path |
 |---|---|
-| `mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp:174` | `transfer_read` to `gpu.subgroup_mma` |
-| `mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp:200` | `transfer_write` to `gpu.subgroup_mma` |
-| `mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp:506` | `nvgpu.mma.sync` path |
-| `mlir/lib/Dialect/NVGPU/Utils/MMAUtils.cpp:270,297` | `canLowerToWarpMatrixOperation` |
+| `mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp:174` | `transferReadSupportsMMAMatrixType` (`gpu.subgroup_mma` read) |
+| `mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp:200` | `transferWriteSupportsMMAMatrixType` (`gpu.subgroup_mma` write) |
+| `mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp:506` | `CombineTransferReadOpTranspose` (fold transpose into transfer read) |
+| `mlir/lib/Dialect/NVGPU/Utils/MMAUtils.cpp:270,297` | `nvgpu::canLowerToWarpMatrixOperation` (read/write on the `nvgpu.mma.sync` path) |
 
-All of them read `op.getMask() || op.hasOutOfBoundsDim()` and bail.
+Each has an equivalent `getMask() || hasOutOfBoundsDim()` guard.
 
 ## B, C. What a masked load costs in PTX
 
@@ -125,7 +125,9 @@ form, or rederived where the IR contains sufficient size and index constraints, 
 `convert-vector-to-gpu`; eliminating an explicit all-true mask alone does not cover the mask-free
 A3 case.
 
-The mechanism meant for that job is `vector::eliminateVectorMasks`, and today it cannot do it:
+Separately, `vector::eliminateVectorMasks` can replace a provably all-true `vector.create_mask`
+with a constant mask, but it cannot supply the missing boundedness guarantee in A3. Even that mask
+elimination is unavailable for fixed-size vectors in production pipelines today:
 
 - it is scalable-only, `mlir/lib/Dialect/Vector/Transforms/VectorMaskElimination.cpp:99` returns
   immediately when there is no `vscaleRange`;
