@@ -12,10 +12,10 @@ func.func @dyn_masked(%a: memref<?x?xf16, #gpu.address_space<workgroup>>,
   %maskA = vector.create_mask %m, %k : vector<16x16xi1>
   %maskB = vector.create_mask %k, %n : vector<16x8xi1>
   %maskC = vector.create_mask %m, %n : vector<16x8xi1>
-  %A = vector.transfer_read %a[%c0, %c0], %f0, %maskA {in_bounds = [true, true]} : memref<?x?xf16, #gpu.address_space<workgroup>>, vector<16x16xf16>
-  %B = vector.transfer_read %b[%c0, %c0], %f0, %maskB {permutation_map = #rowcol, in_bounds = [true, true]} : memref<?x?xf16, #gpu.address_space<workgroup>>, vector<8x16xf16>
-  %C = vector.transfer_read %c[%c0, %c0], %f0, %maskC {in_bounds = [true, true]} : memref<?x?xf16, #gpu.address_space<workgroup>>, vector<16x8xf16>
+  %A = vector.transfer_read %a[%c0, %c0], %f0, %maskA : memref<?x?xf16, #gpu.address_space<workgroup>>, vector<16x16xf16>
+  %B = vector.transfer_read %b[%c0, %c0], %f0, %maskB {permutation_map = #rowcol} : memref<?x?xf16, #gpu.address_space<workgroup>>, vector<8x16xf16>
+  %C = vector.transfer_read %c[%c0, %c0], %f0, %maskC : memref<?x?xf16, #gpu.address_space<workgroup>>, vector<16x8xf16>
   %D = vector.contract {indexing_maps = [#mA, #mB, #mC], iterator_types = ["parallel", "parallel", "reduction"], kind = #vector.kind<add>} %A, %B, %C : vector<16x16xf16>, vector<8x16xf16> into vector<16x8xf16>
-  vector.transfer_write %D, %c[%c0, %c0], %maskC {in_bounds = [true, true]} : vector<16x8xf16>, memref<?x?xf16, #gpu.address_space<workgroup>>
+  vector.transfer_write %D, %c[%c0, %c0], %maskC : vector<16x8xf16>, memref<?x?xf16, #gpu.address_space<workgroup>>
   return
 }

@@ -32,8 +32,10 @@ A3_tensorcore_no_in_bounds       ldmatrix=0 mma.sync=0 transfer_read_left=3 cont
 ```
 
 With `in_bounds = [true, true]` the tile becomes three `nvgpu.ldmatrix` and one `nvgpu.mma.sync`.
-With an explicit runtime mask, the transfers and contract remain. More importantly,
-`A3_tensorcore_no_in_bounds.mlir` is the RFC proposal itself rather than a masked substitute:
+The explicit-runtime-mask arm has no `in_bounds` attribute, so it does not use the
+mask-plus-`in_bounds` combination marked for future restriction in `VectorOps.td`. Its transfers
+and contract remain. More importantly, `A3_tensorcore_no_in_bounds.mlir` is the RFC proposal itself
+rather than a masked substitute:
 there is no `in_bounds` and no explicit mask. It reaches the same conversion cliff.
 
 `A1_tensorcore_kernel.mlir` also carries the positive arm through
@@ -66,6 +68,9 @@ All of them read `op.getMask() || op.hasOutOfBoundsDim()` and bail.
 | `read_partial_constant_mask_in_bounds` (`constant_mask [3]`) | 10 | 0 | 3 |
 | `write_in_bounds` | 10 | 0 | 0 |
 | `write_maybe_oob` | 22 | 4 | 0 |
+
+The rows combining a mask with `in_bounds` are deliberate controls for the current IR: they
+separate mask cost from bounds checks. They are not proposed as the replacement form.
 
 `B*.mlir` is the same experiment at `vector<8xf32>`: 15 instructions and 0 branches with
 `in_bounds`, against 49 instructions and 8 branches with a runtime mask.
@@ -102,7 +107,8 @@ change in vector load width.
 ## D. Same thing with a real kernel ABI
 
 `D_kernel_abi.mlir` repeats the comparison with a real `gpu.func ... kernel` entry point and
-global address space:
+global address space. Unlike A/B/C, it has static memref shapes, but the transfer index is
+dynamic:
 
 | kernel | PTX instructions | branches | `ld.global` |
 |---|---|---|---|
