@@ -126,22 +126,25 @@ form, or rederived where the IR contains sufficient size and index constraints, 
 A3 case.
 
 Separately, `vector::eliminateVectorMasks` can replace a provably all-true `vector.create_mask`
-with a constant mask, but it cannot supply the missing boundedness guarantee in A3. Even that mask
-elimination is unavailable for fixed-size vectors in production pipelines today:
+with a constant mask, but it cannot supply the missing boundedness guarantee in A3. At the time of
+the original experiment on `f0d41abb33b6`, even that mask elimination was unavailable for
+fixed-size vectors in production pipelines:
 
-- it is scalable-only, `mlir/lib/Dialect/Vector/Transforms/VectorMaskElimination.cpp:99` returns
-  immediately when there is no `vscaleRange`;
+- it was scalable-only: `mlir/lib/Dialect/Vector/Transforms/VectorMaskElimination.cpp:99`
+  returned immediately when there was no `vscaleRange` (#221595 was still open);
 - its only in-tree caller is `mlir/test/lib/Dialect/Vector/TestVectorTransforms.cpp`, so it runs in
   no pipeline at all.
 
-PR #221595 proposes a fix for the first, but it is still open, so fixed-size mask elimination is
-not in `main`; the second is unaddressed. This is one part of the GPU problem, while A3 also shows
-that the no-mask representation needs a way to communicate or recover the same proof.
+#221595 has since landed (it is an ancestor of `fc99ddb16876`), which removes the first
+limitation; the second still holds. Section H below shows what fixed-size elimination does and
+does not remove. This is one part of the GPU problem, while A3 also shows that the no-mask
+representation needs a way to communicate or recover the same proof.
 
-Separately, a masked transfer cannot be unrolled today:
-`mlir/lib/Dialect/Vector/Transforms/VectorUnroll.cpp:162` and `:217` bail out when the transfer
-carries a mask. Unrolling to a hardware vector shape is how a tile reaches an mma instruction, so
-this compounds section A.
+Separately, `VectorUnroll` handles the two mask representations inconsistently today. A transfer
+with a mask operand is left unchanged (`mlir/lib/Dialect/Vector/Transforms/VectorUnroll.cpp:162`
+and `:217` bail out), while an operation inside `vector.mask` is unrolled in place and produces
+invalid IR, since the region then holds several ops. Unrolling to a hardware vector
+shape is how a tile reaches an mma instruction, so this compounds section A.
 
 ## Provenance and limits
 
@@ -155,3 +158,61 @@ this compounds section A.
   ratios rather than the absolute numbers.
 - No NVIDIA GPU was available here, so there is no `ptxas`, no SASS and no runtime figure. A
   wall-clock number comparable to the PolyBench result in the thread still needs hardware.
+
+## H, I. Masks that stay: peeled remainder tiles
+
+`eliminateVectorMasks` removes masks that are provably all-true. Peeling produces tiles where the
+masks are genuinely partial, so they stay, and the GPU lowering has to cope with `vector.mask`
+next to unmasked tiles in the same function.
+
+- `H_peeled_matmul.mlir`: a dynamic `linalg.matmul` (`memref<?x?xf16>`) tiled to `[16, 8, 16]`,
+  peeled in all three loops and vectorized with `vector_sizes [16, 8, 16] create_named_contraction`.
+  Lowered with `-convert-vector-to-gpu="use-nvgpu=true"`.
+- `I_peeled_matmul_wmma.mlir`: the vendor-neutral `gpu.subgroup_mma` path. Static row strides,
+  dynamic `M`, `B` stored as `(n, k)`; only the `M` loop is peeled. Lowered with
+  `-convert-vector-to-gpu`.
+
+Two builds are compared; the script prints the md5 of the `mlir-opt` it runs:
+
+```bash
+# llvm-project fc99ddb16876 (includes #221595); mlir-opt md5 c34b9d02c214d872d979462714a5c8d8
+BIN=/path/to/baseline/build/bin ./run_masked_remainders.sh
+# fc99ddb16876 + 848cc47c636e (#226732); mlir-opt md5 f2fd969ff25a6b32d19e1d7b80fee8d9
+BIN=/path/to/patched/build/bin ./run_masked_remainders.sh
+```
+
+The masks are the same with both builds. The vectorizer masks every contraction;
+`-canonicalize` folds the masks of the main loop, whose tiles are static; the remainder loops keep
+theirs, and `eliminateVectorMasks` removes nothing further:
+
+```
+== H_peeled_matmul
+after vectorize:            contract=8 masked_contract=8 vector.mask=40
+after canonicalize:         contract=8 masked_contract=7 vector.mask=31
+after eliminateVectorMasks: contract=8 masked_contract=7 vector.mask=31
+== I_peeled_matmul_wmma
+after vectorize:            contract=2 masked_contract=2 vector.mask=8
+after canonicalize:         contract=2 masked_contract=1 vector.mask=4
+after eliminateVectorMasks: contract=2 masked_contract=1 vector.mask=4
+```
+
+Baseline: preparing the first masked remainder makes the pass fail, so no usable result is
+produced, including for the unmasked main loop:
+
+```
+H_nvgpu            exit=1 error: 'vector.mask' op expects only one operation to mask
+I_subgroup_mma     exit=1 error: 'vector.mask' op expects only one operation to mask
+```
+
+The MMA preparation patterns (`CanonicalizeContractMatmulToMMT` on the nvgpu path,
+`PrepareContractToGPUMMA` on the `gpu.subgroup_mma` path) rewrite a remainder contraction in
+place and leave extra ops inside its `vector.mask` region: a `vector.transpose` in H, and in I the
+same transpose already folded into a new `vector.transfer_read`.
+
+Patched (#226732): masked contractions are left alone by the preparation patterns, the masked
+remainders stay unchanged, and the eligible main loop lowers to one MMA operation:
+
+```
+H_nvgpu            exit=0 mma.sync=1 subgroup_mma_compute=0 vector.mask=31
+I_subgroup_mma     exit=0 mma.sync=0 subgroup_mma_compute=1 vector.mask=4
+```
