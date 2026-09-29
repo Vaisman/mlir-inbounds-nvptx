@@ -1,29 +1,100 @@
-# NVIDIA datapoint: `in_bounds` vs masking on the NVPTX path
+# Masked Vector operations in GPU pipelines
 
-Companion reproducers for the Discourse RFC *"Should `vector.transfer_read`/`write` keep
-`in_bounds`? Measurements on the masking alternative"*, which grew out of llvm-project PR #215340.
+Companion reproducers for the Discourse RFC
+*[Should `vector.transfer_read`/`write` keep `in_bounds`? Measurements on the masking
+alternative](https://discourse.llvm.org/t/91649)*.
 
-The thread contains CPU datapoints for AArch64 and x86. This package adds the NVIDIA side:
-MLIR to LLVM IR to the NVPTX backend to PTX.
+The primary examples, H and I, start from an upstream `linalg.matmul` pipeline and show why
+genuinely partial masks remain on peeled tiles. The earlier A-D examples record the current
+NVPTX lowering and its generated PTX.
 
 ## How to run
+
+For the peeled-remainder examples H and I:
+
+```bash
+BIN=/path/to/llvm-project/build/bin ./run_masked_remainders.sh
+```
+
+This requires `mlir-opt` with the MLIR test passes enabled. For the earlier NVPTX examples A-D:
 
 ```bash
 LLVM_SOURCE_ROOT=/path/to/llvm-project BIN=/path/to/llvm-project/build/bin ./run.sh
 ```
 
-Needs `mlir-opt`, `mlir-translate` and `llc` built with `NVPTX` in `LLVM_TARGETS_TO_BUILD`.
-Both paths are required: `LLVM_SOURCE_ROOT` identifies the source checkout for provenance, while
-`BIN` points to the built tools (which may live in an out-of-tree build).
-No GPU and no CUDA toolkit required: everything here is static PTX emitted by `llc`.
+The A-D script needs `mlir-opt`, `mlir-translate` and `llc` built with `NVPTX` in
+`LLVM_TARGETS_TO_BUILD`. `LLVM_SOURCE_ROOT` identifies the source checkout for provenance, while
+`BIN` points to the built tools. No GPU or CUDA toolkit is required: the script emits static PTX.
 
-## A. Removing `in_bounds` blocks the current Tensor Core path
+## H, I. Masks that stay: peeled remainder tiles
+
+`eliminateVectorMasks` removes masks that are provably all-true. Peeling produces tiles whose
+masks are genuinely partial, so they stay, and GPU conversion has to coexist with masked and
+unmasked tiles in the same function.
+
+- `H_peeled_matmul.mlir`: a dynamic `linalg.matmul` (`memref<?x?xf16>`) tiled to `[16, 8, 16]`,
+  peeled in all three loops and vectorized with `vector_sizes [16, 8, 16] create_named_contraction`.
+  Lowered with `-convert-vector-to-gpu="use-nvgpu=true"`.
+- `I_peeled_matmul_wmma.mlir`: the vendor-neutral `gpu.subgroup_mma` path. Static row strides,
+  dynamic `M`, `B` stored as `(n, k)`; only the `M` loop is peeled. Lowered with
+  `-convert-vector-to-gpu`.
+
+Two builds are compared; the script prints the md5 of the `mlir-opt` it runs:
+
+```bash
+# llvm-project fc99ddb16876 (includes llvm-project#221595)
+# mlir-opt md5 c34b9d02c214d872d979462714a5c8d8
+BIN=/path/to/baseline/build/bin ./run_masked_remainders.sh
+
+# fc99ddb16876 + 0f87d4ee7e91 (tree-identical to llvm-project#226732 head 848cc47c636e)
+# mlir-opt md5 f2fd969ff25a6b32d19e1d7b80fee8d9
+BIN=/path/to/patched/build/bin ./run_masked_remainders.sh
+```
+
+The vectorizer masks every contraction. `-canonicalize` folds the masks of the full main tile,
+whose sizes are static. The remainder loops keep their masks, and `eliminateVectorMasks` removes
+nothing further:
+
+```
+== H_peeled_matmul
+after vectorize:            contract=8 masked_contract=8 vector.mask=40
+after canonicalize:         contract=8 masked_contract=7 vector.mask=31
+after eliminateVectorMasks: contract=8 masked_contract=7 vector.mask=31
+== I_peeled_matmul_wmma
+after vectorize:            contract=2 masked_contract=2 vector.mask=8
+after canonicalize:         contract=2 masked_contract=1 vector.mask=4
+after eliminateVectorMasks: contract=2 masked_contract=1 vector.mask=4
+```
+
+On the baseline, preparing the first masked remainder makes the pass fail, so it produces no
+usable result for the function, including the unmasked main loop:
+
+```
+H_nvgpu            exit=1 error: 'vector.mask' op expects only one operation to mask
+I_subgroup_mma     exit=1 error: 'vector.mask' op expects only one operation to mask
+```
+
+The MMA preparation patterns (`CanonicalizeContractMatmulToMMT` on the nvgpu path and
+`PrepareContractToGPUMMA` on the `gpu.subgroup_mma` path) rewrite a remainder contraction in
+place and leave extra operations inside its `vector.mask` region: a `vector.transpose` in H, and
+in I the same transpose already folded into a new `vector.transfer_read`.
+
+With [llvm-project#226732](https://github.com/llvm/llvm-project/pull/226732), masked contractions
+are left unchanged by the preparation patterns. The pass succeeds, the eligible main loop lowers
+to one MMA operation, and the masked remainders remain in Vector IR:
+
+```
+H_nvgpu            exit=0 mma.sync=1 subgroup_mma_compute=0 vector.mask=31
+I_subgroup_mma     exit=0 mma.sync=0 subgroup_mma_compute=1 vector.mask=4
+```
+
+## A. Current GPU conversion distinguishes `in_bounds`, masks and neither
 
 `A1_tensorcore_in_bounds.mlir`, `A2_tensorcore_masked.mlir`, and
 `A3_tensorcore_no_in_bounds.mlir` are the same 16x8x16 f16 GEMM tile feeding a
-`vector.contract`. They use **dynamic**
-`memref<?x?xf16, #gpu.address_space<workgroup>>`, so the folder cannot derive boundedness from the
-types.
+`vector.contract`. They use dynamic `memref<?x?xf16, #gpu.address_space<workgroup>>`. These files
+record how the current IR and GPU conversion distinguish an `in_bounds` transfer, a runtime-masked
+transfer, and a transfer with neither property.
 
 ```
 A1_tensorcore_in_bounds          ldmatrix=3 mma.sync=1 transfer_read_left=0 contract_left=0
@@ -31,20 +102,22 @@ A2_tensorcore_masked             ldmatrix=0 mma.sync=0 transfer_read_left=3 cont
 A3_tensorcore_no_in_bounds       ldmatrix=0 mma.sync=0 transfer_read_left=3 contract_left=1
 ```
 
-With `in_bounds = [true, true]` the tile becomes three `nvgpu.ldmatrix` and one `nvgpu.mma.sync`.
-The explicit-runtime-mask arm has no `in_bounds` attribute, so it does not use the
-mask-plus-`in_bounds` combination marked for future restriction in `VectorOps.td`. Its transfers
-and contract remain. `A3_tensorcore_no_in_bounds.mlir` is a mask-free diagnostic control, not the
-proposal itself: it shows the form left if A2's mask can be proved all-true and eliminated. The
-dynamic memref extents still provide no proof that the tile is in bounds, so it reaches the same
-conversion cliff.
+With `in_bounds = [true, true]`, A1 becomes three `nvgpu.ldmatrix` operations and one
+`nvgpu.mma.sync`. A2 has a runtime mask and remains in Vector IR. A3 is a diagnostic control for
+today's semantics: because it has neither a mask nor `in_bounds`, current conversion also leaves it
+in Vector IR.
+
+A3 is **not** a blocker for the proposed mask-only semantics. Under the proposed rule, an
+out-of-bounds access must be masked and is otherwise undefined, so an unmasked transfer is in
+bounds by definition. Once `in_bounds` is removed, GPU conversion can treat the A3 form as
+eligible without recovering a separate bounds proof. A2 remains the relevant case: a genuinely
+partial mask cannot be eliminated and must either be handled or cause a safe fallback.
 
 `A1_tensorcore_kernel.mlir` also carries the positive arm through
 `mlir-opt -> mlir-translate -> llc`; its PTX contains three `ldmatrix.sync` and one
 `mma.sync`.
 
-This is not a cost difference, it is a capability cliff, and it is structural. The relevant GPU
-conversion checks below all require an unmasked, in-bounds transfer:
+The current results come from these GPU conversion checks:
 
 | location | guarded path |
 |---|---|
@@ -53,7 +126,9 @@ conversion checks below all require an unmasked, in-bounds transfer:
 | `mlir/lib/Conversion/VectorToGPU/VectorToGPU.cpp:506` | `CombineTransferReadOpTranspose` (fold transpose into transfer read) |
 | `mlir/lib/Dialect/NVGPU/Utils/MMAUtils.cpp:270,297` | `nvgpu::canLowerToWarpMatrixOperation` (read/write on the `nvgpu.mma.sync` path) |
 
-Each has an equivalent `getMask() || hasOutOfBoundsDim()` guard.
+Each currently has an equivalent `getMask() || hasOutOfBoundsDim()` guard. The mask half remains
+relevant for partial tiles. The `hasOutOfBoundsDim()` half reflects the current `in_bounds`
+semantics and is not evidence that the proposed no-mask form needs another boundedness marker.
 
 ## B, C. What a masked load costs in PTX
 
@@ -89,9 +164,10 @@ time:
   so `llvm.masked.load` is scalarized into per-lane conditional blocks. In this reproducer the
   boundary input is uniform, so the branches do not imply warp divergence. In a typical tiled GEMM
   a boundary derived from a block or thread index can vary across threads and then diverge.
-- Dropping `in_bounds` is itself enough to trigger this. `read_maybe_oob` has no explicit mask at
-  all and still lands on the branchy path, because on a dynamic `memref` nothing can prove the
-  access safe.
+- Under today's semantics, omitting `in_bounds` is enough to trigger this. `read_maybe_oob` has no
+  explicit mask and still lands on the branchy path. This is a measurement of the current
+  lowering, not the proposed semantics: if an unmasked out-of-bounds access becomes undefined,
+  the no-mask form can be lowered as in-bounds instead.
 
 More precisely, the NVPTX TTI supports masked accesses only when
 `MaskKind::ConstantMask`. Runtime masks are rejected and fall back to generic scalarization.
@@ -118,35 +194,29 @@ dynamic:
 
 ## What this implies for the RFC
 
-Section A is the load-bearing result. With today's GPU conversion, either an explicit mask or an
-unproved out-of-bounds dimension prevents the transfer from reaching Tensor Core operations.
-Removing `in_bounds` therefore requires its boundedness guarantee to be carried in another IR
-form, or rederived where the IR contains sufficient size and index constraints, before
-`convert-vector-to-gpu`; eliminating an explicit all-true mask alone does not cover the mask-free
-A3 case.
+H and I are the main result: an upstream tiling, peeling and vectorization pipeline naturally
+produces a mix of unmasked main tiles and genuinely masked remainder tiles. The main-tile masks
+fold away, while the remainder masks cannot. Vector and GPU patterns therefore have to preserve
+region masks or bail out safely; otherwise one remainder can invalidate the whole function and
+prevent conversion of the eligible main tile.
 
-Separately, `vector::eliminateVectorMasks` can replace a provably all-true `vector.create_mask`
-with a constant mask, but it cannot supply the missing boundedness guarantee in A3. At the time of
-the original experiment on `f0d41abb33b6`, even that mask elimination was unavailable for
-fixed-size vectors in production pipelines:
+[llvm-project#221595](https://github.com/llvm/llvm-project/pull/221595) added fixed-size support to
+`eliminateVectorMasks`. H and I include that change. It does not alter their remainder masks,
+because those masks are partial rather than missed all-true cases.
 
-- it was scalable-only: `mlir/lib/Dialect/Vector/Transforms/VectorMaskElimination.cpp:99`
-  returned immediately when there was no `vscaleRange` (#221595 was still open);
-- its only in-tree caller is `mlir/test/lib/Dialect/Vector/TestVectorTransforms.cpp`, so it runs in
-  no pipeline at all.
-
-#221595 has since landed (it is an ancestor of `fc99ddb16876`), which removes the first
-limitation; the second still holds. Section H below shows what fixed-size elimination does and
-does not remove. This is one part of the GPU problem, while A3 also shows that the no-mask
-representation needs a way to communicate or recover the same proof.
+A-D answer a different question: what the current NVPTX path emits when a runtime mask, or the
+absence of `in_bounds`, reaches lower-level conversion. The runtime-mask cost remains useful data,
+but A3 is only a control for today's semantics. It does not show that removing `in_bounds` requires
+another boundedness representation if unmasked out-of-bounds accesses become undefined.
 
 Separately, `VectorUnroll` handles the two mask representations inconsistently today. A transfer
 with a mask operand is left unchanged (`mlir/lib/Dialect/Vector/Transforms/VectorUnroll.cpp:162`
 and `:217` bail out), while an operation inside `vector.mask` is unrolled in place and produces
 invalid IR, since the region then holds several ops. Unrolling to a hardware vector
-shape is how a tile reaches an mma instruction, so this compounds section A.
+shape is how a tile reaches an MMA instruction, so it is another place that must preserve a mask
+or bail out before the migration.
 
-## Provenance and limits
+## Provenance and limits for A-D
 
 - Checkout llvm-project `f0d41abb33b6`.
 - `mlir-opt`, `mlir-translate`, and `llc` were all rebuilt from that checkout on 2026-09-15 before
@@ -158,61 +228,3 @@ shape is how a tile reaches an mma instruction, so this compounds section A.
   ratios rather than the absolute numbers.
 - No NVIDIA GPU was available here, so there is no `ptxas`, no SASS and no runtime figure. A
   wall-clock number comparable to the PolyBench result in the thread still needs hardware.
-
-## H, I. Masks that stay: peeled remainder tiles
-
-`eliminateVectorMasks` removes masks that are provably all-true. Peeling produces tiles where the
-masks are genuinely partial, so they stay, and the GPU lowering has to cope with `vector.mask`
-next to unmasked tiles in the same function.
-
-- `H_peeled_matmul.mlir`: a dynamic `linalg.matmul` (`memref<?x?xf16>`) tiled to `[16, 8, 16]`,
-  peeled in all three loops and vectorized with `vector_sizes [16, 8, 16] create_named_contraction`.
-  Lowered with `-convert-vector-to-gpu="use-nvgpu=true"`.
-- `I_peeled_matmul_wmma.mlir`: the vendor-neutral `gpu.subgroup_mma` path. Static row strides,
-  dynamic `M`, `B` stored as `(n, k)`; only the `M` loop is peeled. Lowered with
-  `-convert-vector-to-gpu`.
-
-Two builds are compared; the script prints the md5 of the `mlir-opt` it runs:
-
-```bash
-# llvm-project fc99ddb16876 (includes #221595); mlir-opt md5 c34b9d02c214d872d979462714a5c8d8
-BIN=/path/to/baseline/build/bin ./run_masked_remainders.sh
-# fc99ddb16876 + 848cc47c636e (#226732); mlir-opt md5 f2fd969ff25a6b32d19e1d7b80fee8d9
-BIN=/path/to/patched/build/bin ./run_masked_remainders.sh
-```
-
-The masks are the same with both builds. The vectorizer masks every contraction;
-`-canonicalize` folds the masks of the main loop, whose tiles are static; the remainder loops keep
-theirs, and `eliminateVectorMasks` removes nothing further:
-
-```
-== H_peeled_matmul
-after vectorize:            contract=8 masked_contract=8 vector.mask=40
-after canonicalize:         contract=8 masked_contract=7 vector.mask=31
-after eliminateVectorMasks: contract=8 masked_contract=7 vector.mask=31
-== I_peeled_matmul_wmma
-after vectorize:            contract=2 masked_contract=2 vector.mask=8
-after canonicalize:         contract=2 masked_contract=1 vector.mask=4
-after eliminateVectorMasks: contract=2 masked_contract=1 vector.mask=4
-```
-
-Baseline: preparing the first masked remainder makes the pass fail, so no usable result is
-produced, including for the unmasked main loop:
-
-```
-H_nvgpu            exit=1 error: 'vector.mask' op expects only one operation to mask
-I_subgroup_mma     exit=1 error: 'vector.mask' op expects only one operation to mask
-```
-
-The MMA preparation patterns (`CanonicalizeContractMatmulToMMT` on the nvgpu path,
-`PrepareContractToGPUMMA` on the `gpu.subgroup_mma` path) rewrite a remainder contraction in
-place and leave extra ops inside its `vector.mask` region: a `vector.transpose` in H, and in I the
-same transpose already folded into a new `vector.transfer_read`.
-
-Patched (#226732): masked contractions are left alone by the preparation patterns, the masked
-remainders stay unchanged, and the eligible main loop lowers to one MMA operation:
-
-```
-H_nvgpu            exit=0 mma.sync=1 subgroup_mma_compute=0 vector.mask=31
-I_subgroup_mma     exit=0 mma.sync=0 subgroup_mma_compute=1 vector.mask=4
-```
