@@ -26,13 +26,22 @@ convert () { # <label> <input> <pass options>
   fi
 }
 
+# llvm-project#226517 replaced -test-eliminate-vector-masks with -eliminate-vector-masks.
+"$OPT" --help > "$OUT/help.txt" 2>&1 || true
+if grep -q -- '--eliminate-vector-masks' "$OUT/help.txt"; then
+  ELIM='-eliminate-vector-masks'
+else
+  ELIM='-test-eliminate-vector-masks=fixed-size'
+fi
+
 echo "mlir-opt: $OPT"
 echo "  mtime: $(stat -c %y "$OPT")"
 echo "  md5:   $(md5sum "$OPT" | cut -d' ' -f1)"
+echo "  mask elimination: $ELIM"
 for c in H_peeled_matmul I_peeled_matmul_wmma; do
   "$OPT" "$HERE/$c.mlir" -transform-interpreter -o "$OUT/$c.vec.mlir"
   "$OPT" "$OUT/$c.vec.mlir" -canonicalize -cse -o "$OUT/$c.canon.mlir"
-  "$OPT" "$OUT/$c.canon.mlir" -test-eliminate-vector-masks=fixed-size -canonicalize -cse \
+  "$OPT" "$OUT/$c.canon.mlir" "$ELIM" -canonicalize -cse \
     -o "$OUT/$c.elim.mlir"
   echo "== $c"
   echo "after vectorize:            $(masks "$OUT/$c.vec.mlir")"

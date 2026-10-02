@@ -16,7 +16,9 @@ For the peeled-remainder examples H and I:
 BIN=/path/to/llvm-project/build/bin ./run_masked_remainders.sh
 ```
 
-This requires `mlir-opt` with the MLIR test passes enabled. For the earlier NVPTX examples A-D:
+The script uses `-eliminate-vector-masks` when `mlir-opt` has it (added by llvm-project#226517) and
+otherwise falls back to the test pass it replaced, which needs the MLIR test passes enabled. For the
+earlier NVPTX examples A-D:
 
 ```bash
 LLVM_SOURCE_ROOT=/path/to/llvm-project BIN=/path/to/llvm-project/build/bin ./run.sh
@@ -50,6 +52,9 @@ BIN=/path/to/baseline/build/bin ./run_masked_remainders.sh
 # mlir-opt md5 f2fd969ff25a6b32d19e1d7b80fee8d9
 BIN=/path/to/patched/build/bin ./run_masked_remainders.sh
 ```
+
+On llvm-project `353edd99a7f0`, which uses the new pass, the mask counts and the baseline failure
+below are unchanged.
 
 The vectorizer masks every contraction. `-canonicalize` folds the masks of the full main tile,
 whose sizes are static. The remainder loops keep their masks, and `eliminateVectorMasks` removes
